@@ -12,7 +12,7 @@ class DyGFormer(nn.Module):
 
     def __init__(self, node_raw_features: np.ndarray, edge_raw_features: np.ndarray, neighbor_sampler: NeighborSampler,
                  time_feat_dim: int, channel_embedding_dim: int, patch_size: int = 1, num_layers: int = 2, num_heads: int = 2,
-                 dropout: float = 0.1, max_input_sequence_length: int = 512, device: str = 'cpu'):
+                 dropout: float = 0.1, max_input_sequence_length: int = 512, device: str = 'cpu', lambda_param : float = 0.1):
         """
         DyGFormer model.
         :param node_raw_features: ndarray, shape (num_nodes + 1, node_feat_dim)
@@ -42,6 +42,8 @@ class DyGFormer(nn.Module):
         self.num_heads = num_heads
         self.dropout = dropout
         self.max_input_sequence_length = max_input_sequence_length
+        self.lambda_param = lambda_param  # Decay parameter for temporal smoothing
+
         self.device = device
 
         self.time_encoder = TimeEncoder(time_dim=time_feat_dim)
@@ -65,60 +67,76 @@ class DyGFormer(nn.Module):
 
         self.output_layer = nn.Linear(in_features=self.num_channels * self.channel_embedding_dim, out_features=self.node_feat_dim, bias=True)
 
+    def apply_temporal_decay(self, timestamps, current_time):
+        """
+        Apply a temporal decay based on the time difference.
+        :param timestamps: Tensor, shape (batch_size, max_seq_length)
+        :param current_time: Tensor, shape (batch_size,)
+        :return: Tensor with decay weights, shape (batch_size, max_seq_length)
+        """
+        time_diff = current_time.unsqueeze(1) - timestamps
+        decay_weights = torch.exp(-self.lambda_param * time_diff)  # Exponential decay
+        return decay_weights
+
     def compute_src_dst_node_temporal_embeddings(self, src_node_ids: np.ndarray, dst_node_ids: np.ndarray, node_interact_times: np.ndarray):
         """
-        compute source and destination node temporal embeddings
+        Compute source and destination node temporal embeddings, with temporal decay applied.
         :param src_node_ids: ndarray, shape (batch_size, )
         :param dst_node_ids: ndarray, shape (batch_size, )
         :param node_interact_times: ndarray, shape (batch_size, )
-        :return:
+        :return: src_node_embeddings, dst_node_embeddings
         """
-        # get the first-hop neighbors of source and destination nodes
-        # three lists to store source nodes' first-hop neighbor ids, edge ids and interaction timestamp information, with batch_size as the list length
+        # Sample neighbors and their interaction times
         src_nodes_neighbor_ids_list, src_nodes_edge_ids_list, src_nodes_neighbor_times_list = \
             self.neighbor_sampler.get_all_first_hop_neighbors(node_ids=src_node_ids, node_interact_times=node_interact_times)
 
-        # three lists to store destination nodes' first-hop neighbor ids, edge ids and interaction timestamp information, with batch_size as the list length
         dst_nodes_neighbor_ids_list, dst_nodes_edge_ids_list, dst_nodes_neighbor_times_list = \
             self.neighbor_sampler.get_all_first_hop_neighbors(node_ids=dst_node_ids, node_interact_times=node_interact_times)
 
-        # pad the sequences of first-hop neighbors for source and destination nodes
-        # src_padded_nodes_neighbor_ids, ndarray, shape (batch_size, src_max_seq_length)
-        # src_padded_nodes_edge_ids, ndarray, shape (batch_size, src_max_seq_length)
-        # src_padded_nodes_neighbor_times, ndarray, shape (batch_size, src_max_seq_length)
+        # Pad sequences for neighbors
         src_padded_nodes_neighbor_ids, src_padded_nodes_edge_ids, src_padded_nodes_neighbor_times = \
-            self.pad_sequences(node_ids=src_node_ids, node_interact_times=node_interact_times, nodes_neighbor_ids_list=src_nodes_neighbor_ids_list,
-                               nodes_edge_ids_list=src_nodes_edge_ids_list, nodes_neighbor_times_list=src_nodes_neighbor_times_list,
-                               patch_size=self.patch_size, max_input_sequence_length=self.max_input_sequence_length)
+            self.pad_sequences(src_node_ids, node_interact_times, src_nodes_neighbor_ids_list, src_nodes_edge_ids_list, src_nodes_neighbor_times_list)
 
-        # dst_padded_nodes_neighbor_ids, ndarray, shape (batch_size, dst_max_seq_length)
-        # dst_padded_nodes_edge_ids, ndarray, shape (batch_size, dst_max_seq_length)
-        # dst_padded_nodes_neighbor_times, ndarray, shape (batch_size, dst_max_seq_length)
         dst_padded_nodes_neighbor_ids, dst_padded_nodes_edge_ids, dst_padded_nodes_neighbor_times = \
-            self.pad_sequences(node_ids=dst_node_ids, node_interact_times=node_interact_times, nodes_neighbor_ids_list=dst_nodes_neighbor_ids_list,
-                               nodes_edge_ids_list=dst_nodes_edge_ids_list, nodes_neighbor_times_list=dst_nodes_neighbor_times_list,
-                               patch_size=self.patch_size, max_input_sequence_length=self.max_input_sequence_length)
+            self.pad_sequences(dst_node_ids, node_interact_times, dst_nodes_neighbor_ids_list, dst_nodes_edge_ids_list, dst_nodes_neighbor_times_list)
+        
 
-        # src_padded_nodes_neighbor_co_occurrence_features, Tensor, shape (batch_size, src_max_seq_length, neighbor_co_occurrence_feat_dim)
-        # dst_padded_nodes_neighbor_co_occurrence_features, Tensor, shape (batch_size, dst_max_seq_length, neighbor_co_occurrence_feat_dim)
+
+        # Neighbor co-occurrence features
         src_padded_nodes_neighbor_co_occurrence_features, dst_padded_nodes_neighbor_co_occurrence_features = \
             self.neighbor_co_occurrence_encoder(src_padded_nodes_neighbor_ids=src_padded_nodes_neighbor_ids,
                                                 dst_padded_nodes_neighbor_ids=dst_padded_nodes_neighbor_ids)
+        
+        # print("\n src_padded_nodes_neighbor_co_occurrence_features shape:", src_padded_nodes_neighbor_co_occurrence_features.shape)
+        # print("\n dst_padded_nodes_neighbor_co_occurrence_features shape:", dst_padded_nodes_neighbor_co_occurrence_features.shape)
 
-        # get the features of the sequence of source and destination nodes
-        # src_padded_nodes_neighbor_node_raw_features, Tensor, shape (batch_size, src_max_seq_length, node_feat_dim)
-        # src_padded_nodes_edge_raw_features, Tensor, shape (batch_size, src_max_seq_length, edge_feat_dim)
-        # src_padded_nodes_neighbor_time_features, Tensor, shape (batch_size, src_max_seq_length, time_feat_dim)
+        # Calculate features for nodes and edges
         src_padded_nodes_neighbor_node_raw_features, src_padded_nodes_edge_raw_features, src_padded_nodes_neighbor_time_features = \
-            self.get_features(node_interact_times=node_interact_times, padded_nodes_neighbor_ids=src_padded_nodes_neighbor_ids,
-                              padded_nodes_edge_ids=src_padded_nodes_edge_ids, padded_nodes_neighbor_times=src_padded_nodes_neighbor_times, time_encoder=self.time_encoder)
+            self.get_features(node_interact_times, src_padded_nodes_neighbor_ids, src_padded_nodes_edge_ids, src_padded_nodes_neighbor_times, self.time_encoder)
 
-        # dst_padded_nodes_neighbor_node_raw_features, Tensor, shape (batch_size, dst_max_seq_length, node_feat_dim)
-        # dst_padded_nodes_edge_raw_features, Tensor, shape (batch_size, dst_max_seq_length, edge_feat_dim)
-        # dst_padded_nodes_neighbor_time_features, Tensor, shape (batch_size, dst_max_seq_length, time_feat_dim)
         dst_padded_nodes_neighbor_node_raw_features, dst_padded_nodes_edge_raw_features, dst_padded_nodes_neighbor_time_features = \
-            self.get_features(node_interact_times=node_interact_times, padded_nodes_neighbor_ids=dst_padded_nodes_neighbor_ids,
-                              padded_nodes_edge_ids=dst_padded_nodes_edge_ids, padded_nodes_neighbor_times=dst_padded_nodes_neighbor_times, time_encoder=self.time_encoder)
+            self.get_features(node_interact_times, dst_padded_nodes_neighbor_ids, dst_padded_nodes_edge_ids, dst_padded_nodes_neighbor_times, self.time_encoder)
+
+        # print("\nsrc_padded_nodes_neighbor_node_raw_features shape:", src_padded_nodes_neighbor_node_raw_features.shape)
+        # print("\ndst_padded_nodes_neighbor_node_raw_features shape:", dst_padded_nodes_neighbor_node_raw_features.shape)
+
+        # Apply temporal decay to source and destination features
+        current_time = torch.tensor(node_interact_times, dtype=torch.float32).to(self.device)
+        src_decay_weights = self.apply_temporal_decay(src_padded_nodes_neighbor_times, current_time)
+        dst_decay_weights = self.apply_temporal_decay(dst_padded_nodes_neighbor_times, current_time)
+
+        src_padded_nodes_neighbor_node_raw_features *= src_decay_weights.unsqueeze(-1)
+        src_padded_nodes_edge_raw_features *= src_decay_weights.unsqueeze(-1)
+        src_padded_nodes_neighbor_time_features *= src_decay_weights.unsqueeze(-1)
+        src_padded_nodes_neighbor_co_occurrence_features *= src_decay_weights.unsqueeze(-1)
+
+        dst_padded_nodes_neighbor_node_raw_features *= dst_decay_weights.unsqueeze(-1)
+        dst_padded_nodes_edge_raw_features *= dst_decay_weights.unsqueeze(-1)
+        dst_padded_nodes_neighbor_time_features *= dst_decay_weights.unsqueeze(-1)
+        dst_padded_nodes_neighbor_co_occurrence_features *= dst_decay_weights.unsqueeze(-1)
+
+        # print("\n src_padded_nodes_neighbor_co_occurrence_features shape:", src_padded_nodes_neighbor_co_occurrence_features.shape)
+        # print("\n dst_padded_nodes_neighbor_co_occurrence_features shape:", dst_padded_nodes_neighbor_co_occurrence_features.shape)
 
         # get the patches for source and destination nodes
         # src_patches_nodes_neighbor_node_raw_features, Tensor, shape (batch_size, src_num_patches, patch_size * node_feat_dim)
